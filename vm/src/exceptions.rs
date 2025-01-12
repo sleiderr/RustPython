@@ -1186,7 +1186,9 @@ pub(super) mod types {
         builtins::{PyStr, PyTuple},
         class::PyClassDef,
         common::lock::PyRwLock,
+        convert::ToPyObject,
         protocol::PySequence,
+        PyPayload,
     };
     use crossbeam_utils::atomic::AtomicCell;
     use itertools::Itertools;
@@ -1222,7 +1224,7 @@ pub(super) mod types {
         #[pymethod(name = "__new__")]
         pub(crate) fn slot_new<'a>(
             cls: PyTypeRef,
-            args: FuncArgs,
+            mut args: FuncArgs,
             vm: &VirtualMachine,
         ) -> PyResult {
             if args.args.len() < 2 {
@@ -1238,7 +1240,7 @@ pub(super) mod types {
                 args.args[0].clone().downcast::<PyStr>(),
                 PySequence::try_protocol(&excs_seq, vm),
             ) {
-                (Ok(msg), Ok(exc)) => (msg, exc),
+                (Ok(msg), Ok(exc)) => (msg, exc.tuple(vm)?),
                 (Ok(_), Err(_)) => {
                     return Err(vm.new_type_error(
                         "second argument (exceptions) must be a Sequence".to_owned(),
@@ -1251,21 +1253,14 @@ pub(super) mod types {
                 }
             };
 
-            let excs_length = exceptions.length(vm)?;
-
-            if excs_length == 0 {
+            if exceptions.is_empty() {
                 return Err(vm.new_value_error(
                     "second argument (exceptions) must be a non-empty sequence".to_owned(),
                 ));
             }
 
-            let (has_only_base_exc, has_only_exc) = (0..excs_length)
-                .map(|i| {
-                    exceptions
-                        .get_item(i.try_into().expect("element index exceed maximum"), vm)
-                        .unwrap()
-                })
-                .fold((true, true), |acc, exc| {
+            let (has_only_base_exc, has_only_exc) =
+                exceptions.iter().fold((true, true), |acc, exc| {
                     (
                         acc.0
                             && exc
@@ -1284,6 +1279,8 @@ pub(super) mod types {
                 ));
             }
 
+            args.args[1] = exceptions.to_pyobject(vm);
+
             if has_only_exc {
                 PyBaseException::slot_new(vm.ctx.exceptions.exception_group.to_owned(), args, vm)
             } else {
@@ -1293,6 +1290,42 @@ pub(super) mod types {
                     PyBaseException::slot_new(cls, args, vm)
                 }
             }
+        }
+
+        #[pyslot]
+        #[pymethod(name = "__init__")]
+        pub(crate) fn slot_init(
+            _zelf: PyObjectRef,
+            _args: FuncArgs,
+            _vm: &VirtualMachine,
+        ) -> ::rustpython_vm::PyResult<()> {
+            Ok(())
+        }
+
+        #[pymethod(magic)]
+        pub(crate) fn str(zelf: PyBaseExceptionRef, vm: &VirtualMachine) -> PyResult<PyStrRef> {
+            let (msg, excs) = (&zelf.args()[0], &zelf.args()[1]);
+
+            match (msg.downcast_ref::<PyStr>(), excs.downcast_ref::<PyTuple>()) {
+                (Some(msg), Some(excs)) => {
+                    Ok(vm
+                        .ctx
+                        .new_str(format!("{} ({} sub-exception(s))", msg, excs.len())))
+                }
+                _ => Err(vm.new_runtime_error("Corrupted BaseExceptionGroup".to_owned())),
+            }
+        }
+
+        #[pymethod]
+        pub(crate) fn derive(
+            zelf: PyBaseExceptionRef,
+            mut args: FuncArgs,
+            vm: &VirtualMachine,
+        ) -> PyResult<PyObjectRef> {
+            args.args.push(zelf.args()[0].clone());
+            args.args.swap(0, 1);
+
+            Self::slot_new(vm.ctx.exceptions.base_exception_group.to_owned(), args, vm)
         }
     }
 
