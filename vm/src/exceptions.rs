@@ -1172,7 +1172,6 @@ pub(crate) fn errno_to_exc_type(_errno: i32, _vm: &VirtualMachine) -> Option<&'s
 }
 
 pub(super) mod types {
-    use crate::common::lock::PyRwLock;
     #[cfg_attr(target_arch = "wasm32", allow(unused_imports))]
     use crate::{
         builtins::{
@@ -1182,6 +1181,12 @@ pub(super) mod types {
         function::FuncArgs,
         types::{Constructor, Initializer},
         AsObject, PyObjectRef, PyRef, PyResult, VirtualMachine,
+    };
+    use crate::{
+        builtins::{PyStr, PyTuple},
+        class::PyClassDef,
+        common::lock::PyRwLock,
+        protocol::PySequence,
     };
     use crossbeam_utils::atomic::AtomicCell;
     use itertools::Itertools;
@@ -1207,13 +1212,102 @@ pub(super) mod types {
     #[derive(Debug)]
     pub struct PySystemExit {}
 
-    #[pyexception(name, base = "PyBaseException", ctx = "base_exception_group", impl)]
+    #[pyexception(name, base = "PyBaseException", ctx = "base_exception_group")]
     #[derive(Debug)]
     pub struct PyBaseExceptionGroup {}
 
-    #[pyexception(name, base = "PyBaseExceptionGroup", ctx = "exception_group", impl)]
+    #[pyexception]
+    impl PyBaseExceptionGroup {
+        #[pyslot]
+        #[pymethod(name = "__new__")]
+        pub(crate) fn slot_new<'a>(
+            cls: PyTypeRef,
+            args: FuncArgs,
+            vm: &VirtualMachine,
+        ) -> PyResult {
+            if args.args.len() < 2 {
+                return Err(vm.new_type_error(format!(
+                    "BaseExceptionGroup constructor takes 2 arguments ({} given)",
+                    args.args.len()
+                )));
+            }
+
+            let excs_seq = args.args[1].clone();
+
+            let (_, exceptions) = match (
+                args.args[0].clone().downcast::<PyStr>(),
+                PySequence::try_protocol(&excs_seq, vm),
+            ) {
+                (Ok(msg), Ok(exc)) => (msg, exc),
+                (Ok(_), Err(_)) => {
+                    return Err(vm.new_type_error(
+                        "second argument (exceptions) must be a Sequence".to_owned(),
+                    ))
+                }
+                _ => {
+                    return Err(
+                        vm.new_type_error("first argument (message) must be a string".to_owned())
+                    )
+                }
+            };
+
+            let excs_length = exceptions.length(vm)?;
+
+            if excs_length == 0 {
+                return Err(vm.new_value_error(
+                    "second argument (exceptions) must be a non-empty sequence".to_owned(),
+                ));
+            }
+
+            let (has_only_base_exc, has_only_exc) = (0..excs_length)
+                .map(|i| {
+                    exceptions
+                        .get_item(i.try_into().expect("element index exceed maximum"), vm)
+                        .unwrap()
+                })
+                .fold((true, true), |acc, exc| {
+                    (
+                        acc.0
+                            && exc
+                                .is_instance(vm.ctx.exceptions.base_exception_type.as_object(), vm)
+                                .unwrap_or_default(),
+                        acc.1
+                            && exc
+                                .is_instance(vm.ctx.exceptions.exception_type.as_object(), vm)
+                                .unwrap_or_default(),
+                    )
+                });
+
+            if !has_only_base_exc {
+                return Err(vm.new_value_error(
+                    "second argument (exceptions) must contain only BaseException".to_owned(),
+                ));
+            }
+
+            if has_only_exc {
+                PyBaseException::slot_new(vm.ctx.exceptions.exception_group.to_owned(), args, vm)
+            } else {
+                if cls.fast_issubclass(vm.ctx.exceptions.exception_group) {
+                    Err(vm.new_type_error(format!("Cannot nest BaseException in {}", cls.name())))
+                } else {
+                    PyBaseException::slot_new(cls, args, vm)
+                }
+            }
+        }
+    }
+
+    #[pyexception(name, base = "PyBaseExceptionGroup", ctx = "exception_group")]
     #[derive(Debug)]
     pub struct PyExceptionGroup {}
+
+    #[pyexception]
+    impl PyExceptionGroup {
+        #[pyslot]
+        #[pymethod(name = "__new__")]
+        pub(crate) fn slot_new(cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+            <Self as PyClassDef>::Base::slot_new(cls, args, vm)
+        }
+    }
 
     #[pyexception(name, base = "PyBaseException", ctx = "generator_exit", impl)]
     #[derive(Debug)]
