@@ -1183,15 +1183,17 @@ pub(super) mod types {
         AsObject, PyObjectRef, PyRef, PyResult, VirtualMachine,
     };
     use crate::{
-        builtins::{PyStr, PyTuple},
+        builtins::{PyFunction, PyStr, PyTuple, PyType},
         class::PyClassDef,
         common::lock::PyRwLock,
         convert::ToPyObject,
+        function::KwArgs,
         protocol::PySequence,
-        PyPayload,
     };
     use crossbeam_utils::atomic::AtomicCell;
     use itertools::Itertools;
+
+    use super::check_exception_matches;
 
     // This module is designed to be used as `use builtins::*;`.
     // Do not add any pub symbols not included in builtins module.
@@ -1222,7 +1224,7 @@ pub(super) mod types {
     impl PyBaseExceptionGroup {
         #[pyslot]
         #[pymethod(name = "__new__")]
-        pub(crate) fn slot_new<'a>(
+        pub(crate) fn slot_new(
             cls: PyTypeRef,
             mut args: FuncArgs,
             vm: &VirtualMachine,
@@ -1283,12 +1285,10 @@ pub(super) mod types {
 
             if has_only_exc {
                 PyBaseException::slot_new(vm.ctx.exceptions.exception_group.to_owned(), args, vm)
+            } else if cls.fast_issubclass(vm.ctx.exceptions.exception_group) {
+                Err(vm.new_type_error(format!("Cannot nest BaseException in {}", cls.name())))
             } else {
-                if cls.fast_issubclass(vm.ctx.exceptions.exception_group) {
-                    Err(vm.new_type_error(format!("Cannot nest BaseException in {}", cls.name())))
-                } else {
-                    PyBaseException::slot_new(cls, args, vm)
-                }
+                PyBaseException::slot_new(cls, args, vm)
             }
         }
 
@@ -1322,10 +1322,122 @@ pub(super) mod types {
             mut args: FuncArgs,
             vm: &VirtualMachine,
         ) -> PyResult<PyObjectRef> {
+            if args.args.len() != 1 {
+                return Err(vm.new_type_error(format!(
+                    "BaseExceptionGroup.derive() takes exactly one argument ({} given)",
+                    args.args.len()
+                )));
+            }
+
             args.args.push(zelf.args()[0].clone());
             args.args.swap(0, 1);
 
             Self::slot_new(vm.ctx.exceptions.base_exception_group.to_owned(), args, vm)
+        }
+
+        #[pymethod]
+        pub(crate) fn split(
+            zelf: PyObjectRef,
+            args: FuncArgs,
+            vm: &VirtualMachine,
+        ) -> PyResult<PyTupleRef> {
+            if args.args.len() != 1 {
+                return Err(vm.new_type_error(format!(
+                    "BaseExceptionGroup.derive() takes exactly one argument ({} given)",
+                    args.args.len()
+                )));
+            }
+
+            let condition = args.args[0].clone();
+            let matcher: Box<dyn Fn(&PyObjectRef) -> PyResult<bool>> =
+                if let Some(pred) = condition.downcast_ref::<PyFunction>() {
+                    Box::new(move |exc: &PyObjectRef| {
+                        let mut args = FuncArgs::default();
+                        args.prepend_arg(exc.clone());
+                        let ret = pred.invoke(args, vm);
+
+                        ret.and_then(|z| z.is_true(vm))
+                    })
+                } else if condition.payload_is::<PyType>() {
+                    Box::new(|exc| check_exception_matches(exc, &condition, vm))
+                } else {
+                    return Err(vm.new_type_error("msg".to_owned()));
+                };
+
+            let (matches, rest) = Self::split_inner(zelf.clone(), &matcher, vm)?;
+
+            Ok((
+                Self::subset(
+                    zelf.clone().downcast::<PyBaseException>().unwrap(),
+                    &matches,
+                    vm,
+                )?,
+                Self::subset(zelf.downcast::<PyBaseException>().unwrap(), &rest, vm)?,
+            )
+                .into_pytuple(vm))
+        }
+
+        fn split_inner<'a>(
+            zelf: PyObjectRef,
+            matcher: &Box<dyn Fn(&PyObjectRef) -> PyResult<bool> + 'a>,
+            vm: &'a VirtualMachine,
+        ) -> PyResult<(Vec<PyObjectRef>, Vec<PyObjectRef>)> {
+            // perfect match
+            if matcher(&zelf)? {
+                return Ok((vec![zelf], vec![]));
+            }
+
+            if !zelf.fast_isinstance(vm.ctx.exceptions.base_exception_group) {
+                return Ok((vec![], vec![zelf]));
+            }
+
+            let exc_group = zelf.downcast_ref::<PyBaseException>().expect("");
+            let excs = &exc_group.args()[1];
+
+            let Some(excs) = excs.downcast_ref::<PyTuple>() else {
+                return Err(vm.new_runtime_error(
+                    "BaseExceptionGroup wrapped excs must be a tuple".to_owned(),
+                ));
+            };
+
+            let mut matches = vec![];
+            let mut rest = vec![];
+
+            for exc in excs {
+                vm.with_recursion(" in exceptiongroup_split", || {
+                    let (inner_matches, inner_rest) = Self::split_inner(exc.clone(), matcher, vm)?;
+
+                    matches.extend(inner_matches);
+                    rest.extend(inner_rest);
+
+                    Ok(())
+                })?;
+            }
+
+            Ok((matches, rest))
+        }
+
+        fn subset(
+            origin: PyBaseExceptionRef,
+            excs: &[PyObjectRef],
+            vm: &VirtualMachine,
+        ) -> PyResult<PyObjectRef> {
+            let exc_group = Self::derive(
+                origin.clone(),
+                FuncArgs::new(
+                    vec![vm.ctx.new_tuple(excs.to_vec()).to_pyobject(vm)],
+                    KwArgs::default(),
+                ),
+                vm,
+            )?;
+
+            if let Some(exc_group) = exc_group.downcast_ref::<PyBaseException>() {
+                exc_group.set_traceback(origin.traceback());
+                exc_group.set_context(origin.context());
+                exc_group.set_cause(origin.cause());
+            }
+
+            Ok(exc_group)
         }
     }
 
@@ -1853,4 +1965,26 @@ pub(super) mod types {
     #[pyexception(name, base = "PyWarning", ctx = "encoding_warning", impl)]
     #[derive(Debug)]
     pub struct PyEncodingWarning {}
+}
+
+pub(crate) fn check_exception_matches(
+    err: &PyObjectRef,
+    exc: &PyObjectRef,
+    vm: &VirtualMachine,
+) -> PyResult<bool> {
+    if let Some(exc) = exc.downcast_ref::<PyTuple>() {
+        return Ok(exc
+            .iter()
+            .all(|e| check_exception_matches(err, e, vm).unwrap_or_default()));
+    }
+
+    let err_type = err.obj_type();
+
+    if err_type.is_subclass(vm.ctx.exceptions.base_exception_type.as_object(), vm)?
+        && exc.is_subclass(vm.ctx.exceptions.base_exception_type.as_object(), vm)?
+    {
+        err_type.is_subclass(exc, vm)
+    } else {
+        Ok(err.is(exc))
+    }
 }
